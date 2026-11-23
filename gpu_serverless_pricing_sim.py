@@ -145,7 +145,11 @@ class Config:
     shapley_perms: int = 64
     shapley_exact_max: int = 8
     core_samples: int = 300
-    core_exact_max: int = 8
+    core_exact_max: int = 20
+    core_search_starts: int = 50
+    work_pred: str = "oracle"
+    dump_cells: bool = False
+    work_pred_sigma: float = 0.0
     keep_details: bool = False
     calibrate: bool = False
 
@@ -326,7 +330,7 @@ class CostGame:
         n = len(P)
         phiB = np.zeros(n)
         for j in range(st.size):
-            cov = (st <= st[j]) & (en >= st[j]) & (us != us[j])
+            cov = ((st < st[j]) | ((st == st[j]) & (us < us[j]))) & (en >= st[j]) & (us != us[j])
             covu = np.unique(us[cov])
             k = covu.size
             phiB[us[j]] += 1.0 / (k + 1)
@@ -341,6 +345,42 @@ class CostGame:
                 phiU[covu] += (b - a) / covu.size
         phi = self.bc * phiB + self.ip * phiU
         return {u: float(phi[k]) for k, u in enumerate(P)}
+
+    def coalition_structure(self):
+        """Grouped interval starts (owner bit, cover mask) and elementary segments (cover mask, length)."""
+        P = self.players
+        st = np.concatenate([self.iv[u][0] for u in P])
+        en = np.concatenate([self.iv[u][1] for u in P])
+        us = np.concatenate([np.full(self.iv[u][0].size, k) for k, u in enumerate(P)])
+        boots = defaultdict(int)
+        for j in range(st.size):
+            cov = ((st < st[j]) | ((st == st[j]) & (us < us[j]))) & (en >= st[j]) & (us != us[j])
+            cm = 0
+            for k in np.unique(us[cov]):
+                cm |= 1 << int(k)
+            boots[(int(us[j]), cm)] += 1
+        segs = defaultdict(float)
+        pts = np.unique(np.concatenate([st, en]))
+        for a, b in zip(pts[:-1], pts[1:]):
+            mid = 0.5 * (a + b)
+            vm = 0
+            for k in np.unique(us[(st <= mid) & (en >= mid)]):
+                vm |= 1 << int(k)
+            if vm:
+                segs[vm] += b - a
+        return boots, segs
+
+    def all_coalition_costs(self):
+        """c(S) for every coalition S (bitmask over self.players), using the Theorem 1 decomposition."""
+        n = len(self.players)
+        M = np.arange(1 << n, dtype=np.int64)
+        boots, segs = self.coalition_structure()
+        c = np.zeros(1 << n)
+        for (o, cm), cnt in boots.items():
+            c += self.bc * cnt * (((M >> o) & 1).astype(bool) & ((M & cm) == 0))
+        for vm, ln in segs.items():
+            c += self.ip * ln * ((M & vm) != 0)
+        return c
 
     def shapley(self, rng, perms: int, exact_max: int, method: str = "mc"):
         if method == "closed_form":
@@ -381,13 +421,15 @@ class CostGame:
 
 
 class Req:
-    __slots__ = ("rid", "user", "m", "rnd", "arr", "work", "cold", "om", "slo")
+    __slots__ = ("rid", "user", "m", "rnd", "arr", "work", "cold", "om", "slo", "west", "slo_est")
 
     def __init__(self, rid, user, m, rnd, arr, work):
         self.rid, self.user, self.m, self.rnd, self.arr, self.work = rid, user, m, rnd, arr, work
         self.cold = False
         self.om = m
         self.slo = float("inf")
+        self.west = work
+        self.slo_est = float("inf")
 
 
 class Instance:
@@ -487,8 +529,8 @@ class ModelServer:
         warm = [i for i in self.instances if i.state in ("idle", "busy")]
         booting = [i for i in self.instances if i.state == "booting"]
         strict = self.cfg.admission_strict if strict is None else strict
-        deadline = req.arr + req.slo * (1.0 + self.cfg.admission_slack)
-        own = self.T1 * req.work
+        deadline = req.arr + req.slo_est * (1.0 + self.cfg.admission_slack)
+        own = self.T1 * req.west
         if not warm:
             if any(i.boot_end + own <= deadline for i in booting):
                 return True
@@ -548,12 +590,12 @@ class ModelServer:
         if self.cfg.batching == "sla_aware" and self.cfg.target_util > 0 and n >= self.target_batch():
             return True, None
         if self.cfg.batching == "fixed":
-            t_dead = q[0].arr + self.cfg.fixed_timeout_frac * q[0].slo
+            t_dead = q[0].arr + self.cfg.fixed_timeout_frac * q[0].slo_est
             return (now >= t_dead), t_dead
         fn = self.f(min(n + 1, self.B))
-        latest_start = min(r.arr + r.slo * (1 - self.cfg.sla_margin_frac) - self.T1 * r.work * fn
+        latest_start = min(r.arr + r.slo_est * (1 - self.cfg.sla_margin_frac) - self.T1 * r.west * fn
                            for r in q[:self.B])
-        latest_start = min(latest_start, q[0].arr + self.cfg.batch_max_wait_frac * q[0].slo)
+        latest_start = min(latest_start, q[0].arr + self.cfg.batch_max_wait_frac * q[0].slo_est)
         if now >= latest_start:
             return True, None
         exp_gap = self.gap_ema if self.gap_ema is not None else float("inf")
@@ -732,6 +774,41 @@ def solve_stackelberg(q0h, eh, p_ref, eps, ch, vh, refund, cs_w, fee=None):
     return 0.5 * (a + b)
 
 
+def core_local_search(g, xv, k, rng, starts):
+    """Large games: maximize the excess x(S) - k c(S) by local search from targeted and random starts.
+    Targeted starts: each user with the users whose warm intervals overlap its own."""
+    P = g.players
+    n = len(P)
+    ivs = [g.iv[u] for u in P]
+    def overlap(a, b):
+        sa, ea = ivs[a]; sb, eb = ivs[b]
+        return bool(((sa[:, None] <= eb[None, :]) & (sb[None, :] <= ea[:, None])).any())
+    inits = []
+    for a in range(n):
+        inits.append({a} | {b for b in range(n) if b != a and overlap(a, b)})
+    for _ in range(starts):
+        inits.append(set(rng.choice(n, size=int(rng.integers(1, n)), replace=False).tolist()))
+    def val(S):
+        if not S or len(S) == n:
+            return -np.inf, -np.inf
+        c = k * g.cost([P[i] for i in S])
+        e = xv[list(S)].sum() - c
+        return e, (e / c if c > 0 else -np.inf)
+    best_e, best_r = -np.inf, -np.inf
+    for S in inits:
+        S = set(S); e, rr = val(S)
+        improved = True
+        while improved:
+            improved = False
+            for i in range(n):
+                T = S ^ {i}
+                e2, r2 = val(T)
+                if e2 > e + 1e-15:
+                    S, e, rr, improved = T, e2, r2, True
+        best_e, best_r = max(best_e, e), max(best_r, rr)
+    return best_e, best_r
+
+
 def allocate_cell(method, times_by_user, O, boots_cell, idle_cell, cfg, spec, rng, shap_cache, key):
     """Allocate the measured overhead O of one (round, model) among its users."""
     users = sorted(times_by_user)
@@ -747,6 +824,12 @@ def allocate_cell(method, times_by_user, O, boots_cell, idle_cell, cfg, spec, rn
         return {u: v * O / tot for u, v in x.items()} if tot > 0 else {}
     if method == "equal":
         return {u: O / len(users) for u in users}
+    if method == "standalone":
+        g = CostGame(times_by_user, cfg.keepalive_s, spec.cold_start_s * cfg.cold_scale * spec.gpu_price_h / 3600,
+                     spec.gpu_price_h / 3600)
+        sa = {u: g.cost([u]) for u in users}
+        tot = sum(sa.values())
+        return {u: O * sa[u] / tot for u in users} if tot > 0 else {u: O / len(users) for u in users}
     if method == "proportional":
         n = {u: len(times_by_user[u]) for u in users}
         N = sum(n.values())
@@ -841,6 +924,7 @@ def simulate(cfg: Config) -> dict:
         return e_hat[ids], np.zeros(len(ids))
     snapshot = {}
     rid_counter = [0]
+    rng_pred = np.random.default_rng([cfg.seed, 77])
 
     def injector(evts):
         for (t, uid, m, rnd, w) in evts:
@@ -850,6 +934,11 @@ def simulate(cfg: Config) -> dict:
             rid_counter[0] += 1
             rq_ = Req(rid_counter[0], uid, m, rnd, env.now, w)
             rq_.slo = servers[m].req_slo(w)
+            if cfg.work_pred == "mean":
+                rq_.west = 1.0 if cfg.models[m].token_based else w
+            elif cfg.work_pred == "noisy" and cfg.models[m].token_based:
+                rq_.west = w * float(rng_pred.lognormal(-cfg.work_pred_sigma ** 2 / 2, cfg.work_pred_sigma))
+            rq_.slo_est = servers[m].req_slo(rq_.west)
             servers[m].submit(rq_)
 
     def market():
@@ -1003,6 +1092,9 @@ def postprocess(cfg, users, logs, servers, prices, q_true0, q_plan, e_used, p_re
     Xm = np.zeros(M)
     SA = np.zeros((R, U))
     ir_viol = ir_tot = core_viol = core_tot = 0
+    core_max_exc = -np.inf
+    core_exhaustive = core_sampled = 0
+    cells_dump = {}
     for r in range(R):
         for m in range(M):
             spec = cfg.models[m]
@@ -1018,6 +1110,8 @@ def postprocess(cfg, users, logs, servers, prices, q_true0, q_plan, e_used, p_re
                 continue
             g = CostGame(tb, cfg.keepalive_s, spec.cold_start_s * cfg.cold_scale * spec.gpu_price_h / 3600,
                          spec.gpu_price_h / 3600)
+            if cfg.dump_cells:
+                cells_dump[(r, m)] = ({u: np.asarray(v) for u, v in tb.items()}, O, g.bc, g.ip)
             cN = g.cost(g.players)
             if cN <= 0:
                 continue
@@ -1031,14 +1125,26 @@ def postprocess(cfg, users, logs, servers, prices, q_true0, q_plan, e_used, p_re
                 ir_viol += x.get(u, 0.0) > sa + tol
             n = len(g.players)
             if n >= 2 and (cfg.core_samples > 0 or cfg.core_exact_max > 0):
+                xv = np.array([x.get(u, 0.0) for u in g.players])
                 if n <= cfg.core_exact_max:
-                    coals = ([g.players[j] for j in range(n) if mask >> j & 1] for mask in range(1, (1 << n) - 1))
+                    cS = k * g.all_coalition_costs()
+                    xS = np.zeros(1 << n)
+                    for j in range(n):
+                        xS[1 << j:2 << j] = xS[:1 << j] + xv[j]
+                    sel = slice(1, (1 << n) - 1)
+                    exc = xS[sel] - cS[sel]
+                    core_tot += exc.size
+                    core_viol += int((exc > tol).sum())
+                    pos = cS[sel] > tol
+                    if pos.any():
+                        core_max_exc = max(core_max_exc, float((exc[pos] / cS[sel][pos]).max()))
+                    core_exhaustive += 1
                 else:
-                    coals = (list(rng.choice(g.players, size=int(rng.integers(1, n)), replace=False))
-                             for _ in range(cfg.core_samples))
-                for S in coals:
+                    best = core_local_search(g, xv, k, rng, cfg.core_search_starts)
                     core_tot += 1
-                    core_viol += sum(x.get(u, 0.0) for u in S) > k * g.cost(S) + tol
+                    core_viol += best[0] > tol
+                    core_max_exc = max(core_max_exc, best[1])
+                    core_sampled += 1
 
     n_ur = np.zeros((R, U))
     np.add.at(n_ur, (rq["rnd"].to_numpy(), rq["user"].to_numpy()), 1)
@@ -1154,6 +1260,9 @@ def postprocess(cfg, users, logs, servers, prices, q_true0, q_plan, e_used, p_re
         "gini_overhead_per_req": gini(act["overhead_per_req"].fillna(0)),
         "ir_violation_%": 100 * ir_viol / max(1, ir_tot),
         "core_violation_%": 100 * core_viol / max(1, core_tot),
+        "core_max_rel_excess_%": 100 * core_max_exc if np.isfinite(core_max_exc) else np.nan,
+        "core_cells_exhaustive": core_exhaustive,
+        "core_cells_search": core_sampled,
         "spearman_overhead_vs_isolation": corr,
         "active_users": int((per_user["requests"] > 0).sum()),
         "shapley_negative_users_%": neg_users,
@@ -1161,6 +1270,10 @@ def postprocess(cfg, users, logs, servers, prices, q_true0, q_plan, e_used, p_re
     }
 
     out = {"summary": summary, "per_model": per_model}
+    if cfg.dump_cells:
+        out["cells"] = cells_dump
+        out["p_ref"] = np.asarray(p_ref)
+        out["slo_nominal"] = [s_.sla for s_ in servers]
     if cfg.keep_details:
         lat_s = rq[["m", "lat", "sla", "cold", "bsize"]].copy()
         if len(lat_s) > 40000:
@@ -1192,6 +1305,7 @@ ABLATIONS = {
     "w/o Shapley -> Equal": {**_P, "allocation": "equal"},
     "w/o Shapley -> Proportional": {**_P, "allocation": "proportional"},
     "w/o Shapley -> Trigger": {**_P, "allocation": "trigger"},
+    "w/o Shapley -> Stand-alone prop.": {**_P, "allocation": "standalone"},
     "w/o two-part -> Linear tariff": {**_P, "tariff": "linear"},
     "w/o capacity control": {**_P, "admission": False, "fallback": False},
     "w/o fallback (admission only)": {**_P, "fallback": False},
@@ -1340,12 +1454,13 @@ def workload_tables(cfg: Config, details: dict | None):
 COL = {"Industry (Fixed+Trigger)": "#8c8c8c", "Stackelberg-Prop [prior]": "#4c72b0", "Proposed": "#c44e52",
        "Industry + L3": "#3a3a3a", "Stackelberg-Prop + L3": "#9ecae1",
        "w/o Shapley -> Equal": "#dd8452", "w/o Shapley -> Proportional": "#937860",
-       "w/o Shapley -> Trigger": "#64b5cd", "w/o SLA-batch -> Fixed batch": "#55a868",
+       "w/o Shapley -> Trigger": "#64b5cd", "w/o Shapley -> Stand-alone prop.": "#b07aa1", "w/o SLA-batch -> Fixed batch": "#55a868",
        "w/o SLA-batch -> No batch": "#8172b3", "w/o Stackelberg -> Fixed price": "#da8bc3",
        "w/o two-part -> Linear tariff": "#ccb974", "w/o capacity control": "#4d4d4d",
        "w/o fallback (admission only)": "#a6a6a6"}
 ALLOC_NAME = {"Proposed": "Shapley", "w/o Shapley -> Equal": "Equal",
-              "w/o Shapley -> Proportional": "Proportional", "w/o Shapley -> Trigger": "Trigger-pays"}
+              "w/o Shapley -> Proportional": "Proportional", "w/o Shapley -> Trigger": "Trigger-pays",
+              "w/o Shapley -> Stand-alone prop.": "Stand-alone prop."}
 
 
 def _style():

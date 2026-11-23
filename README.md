@@ -17,7 +17,9 @@ gpu_serverless_pricing_sim.py   simulator, mechanisms, experiments, Excel and fi
 scripts/download_data.py        downloads the public traces into data/
 scripts/paper_figures.py        Figures 3-6 of the paper from the Excel outputs
 scripts/paper_tables.py         Tables 7-9 of the paper (Markdown) from the Excel outputs
+scripts/revision_experiments.py estimated request sizes (Table 10) and strategic manipulation
 run_experiments.sh / .bat       runs every experiment of the paper
+run_revision.sh / .bat          runs the experiments added in the revision
 data/                           workload traces (not tracked, see below)
 ```
 
@@ -144,6 +146,20 @@ The same defaults can also be changed in the `USER_SETTINGS` dictionary at the t
 
 The ablation replaces one component of the proposed framework at a time. The sensitivity analysis varies load, keep-alive window, SLO, cold-start time, consumer-surplus weight, price elasticity, and the value of fallback and late responses.
 
+## Experiments added in the revision
+
+```bash
+./run_revision.sh          # Linux / macOS
+run_revision.bat           # Windows
+```
+
+The script repeats the main comparison and the ablation on the four workloads with exact core verification, and then runs two additional experiments on Azure day 1:
+
+- `python scripts/revision_experiments.py workpred --out results_rev/workpred`: the dispatcher uses estimated request sizes (oracle, log-normal noise with log-scale deviation 0.25, 0.5 and 1, and the mean only), while costs and SLOs use the true sizes. The estimate is selected by the `work_pred` and `work_pred_sigma` fields of `Config`.
+- `python scripts/revision_experiments.py manipulation --out results_rev/manipulation`: replays the recorded arrivals of the proposed framework and recomputes the fees when a user splits into two or three accounts or delays requests into the warm intervals of other users.
+
+Core verification enumerates all coalitions of every cost game with at most `core_exact_max = 20` players and uses a local search from targeted and random coalitions for larger games. The results report the violation rates (`ir_violation_%`, `core_violation_%`) and the maximum relative excess `core_max_rel_excess_%`. The ablation includes the proportional-to-stand-alone rule (`w/o Shapley -> Stand-alone prop.`).
+
 ## Outputs
 
 Each run writes the following to its output folder:
@@ -164,6 +180,8 @@ Correspondence with the paper:
 | Fig. 4 | `PerUser_*` sheets (day 1) |
 | Fig. 5 | `Sensitivity_Summary` (day 1) |
 | Fig. 6 | `Shapley_Accuracy`, `Shapley_Scalability` |
+| Table 10 | `workpred.xlsx` of `scripts/revision_experiments.py workpred` |
+| Strategic behavior | `manipulation.xlsx` of `scripts/revision_experiments.py manipulation` |
 
 All random streams are seeded, so repeated runs on the same platform give identical results. Results on the synthetic workload can differ in the last digits across operating systems, and the running times in `Shapley_Scalability` depend on the machine.
 
